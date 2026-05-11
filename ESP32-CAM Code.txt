@@ -1,0 +1,230 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+
+// ---------- Wi-Fi (EDIT THESE) ----------
+const char* ssid = "Chandu";
+const char* password = "chandu777";
+
+// ---------- Camera model / pins ----------
+#define CAMERA_MODEL_AI_THINKER
+#include "camera_pins.h"
+
+// Simple HTTP server
+WiFiServer server(80);
+
+// ---------- Camera init ----------
+static void start_camera() {
+
+    camera_config_t config = {};
+
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+
+    // AI-Thinker pin mapping from camera_pins.h
+    config.pin_d0 = Y2_GPIO_NUM;
+    config.pin_d1 = Y3_GPIO_NUM;
+    config.pin_d2 = Y4_GPIO_NUM;
+    config.pin_d3 = Y5_GPIO_NUM;
+    config.pin_d4 = Y6_GPIO_NUM;
+    config.pin_d5 = Y7_GPIO_NUM;
+    config.pin_d6 = Y8_GPIO_NUM;
+    config.pin_d7 = Y9_GPIO_NUM;
+
+    config.pin_xclk = XCLK_GPIO_NUM;
+    config.pin_pclk = PCLK_GPIO_NUM;
+    config.pin_vsync = VSYNC_GPIO_NUM;
+    config.pin_href = HREF_GPIO_NUM;
+
+    config.pin_sccb_sda = SIOD_GPIO_NUM;
+    config.pin_sccb_scl = SIOC_GPIO_NUM;
+
+    config.pin_pwdn = PWDN_GPIO_NUM;
+    config.pin_reset = RESET_GPIO_NUM;
+
+    config.xclk_freq_hz = 20000000;
+
+    // Capture in RGB565 and convert to JPEG in software
+    config.pixel_format = PIXFORMAT_RGB565;
+
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+
+    config.grab_mode = CAMERA_GRAB_LATEST;
+
+    config.fb_location = psramFound()
+                         ? CAMERA_FB_IN_PSRAM
+                         : CAMERA_FB_IN_DRAM;
+
+    esp_err_t err = esp_camera_init(&config);
+
+    if (err != ESP_OK) {
+        Serial.printf("Camera init failed. err=0x%x\n", err);
+
+        while (true) {
+            delay(1000);
+        }
+    }
+
+    // Light tuning for text scenes
+    sensor_t* s = esp_camera_sensor_get();
+
+    s->set_brightness(s, 1);
+    s->set_saturation(s, -1);
+    s->set_gain_ctrl(s, 1);
+    s->set_exposure_ctrl(s, 1);
+    s->set_whitebal(s, 1);
+}
+
+// ---------- HTTP helpers ----------
+static void send_snapshot(WiFiClient& c) {
+
+    camera_fb_t* fb = esp_camera_fb_get();
+
+    if (!fb) {
+        c.println("HTTP/1.1 503\r\n\r\n");
+        return;
+    }
+
+    uint8_t* jpg = nullptr;
+    size_t len = 0;
+
+    bool ok = frame2jpg(fb, 12, &jpg, &len);
+
+    esp_camera_fb_return(fb);
+
+    if (!ok || !jpg) {
+        c.println("HTTP/1.1 500\r\n\r\n");
+        return;
+    }
+
+    c.print(
+        F("HTTP/1.1 200 OK\r\n"
+          "Content-Type: image/jpeg\r\n"
+          "Content-Length: ")
+    );
+
+    c.print(len);
+    c.print(F("\r\n\r\n"));
+
+    c.write(jpg, len);
+
+    free(jpg);
+}
+
+static void send_stream(WiFiClient& c) {
+
+    c.print(
+        F("HTTP/1.1 200 OK\r\n"
+          "Cache-Control: no-cache\r\n"
+          "Pragma: no-cache\r\n"
+          "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n")
+    );
+
+    while (c.connected()) {
+
+        camera_fb_t* fb = esp_camera_fb_get();
+
+        if (!fb) {
+            break;
+        }
+
+        uint8_t* jpg = nullptr;
+        size_t len = 0;
+
+        bool ok = frame2jpg(fb, 12, &jpg, &len);
+
+        esp_camera_fb_return(fb);
+
+        if (!ok || !jpg) {
+            break;
+        }
+
+        c.print(
+            F("--frame\r\n"
+              "Content-Type: image/jpeg\r\n"
+              "Content-Length: ")
+        );
+
+        c.print(len);
+        c.print(F("\r\n\r\n"));
+
+        c.write(jpg, len);
+        c.print(F("\r\n"));
+
+        free(jpg);
+
+        delay(30);
+    }
+}
+
+void setup() {
+
+    Serial.begin(115200);
+
+    delay(200);
+
+    start_camera();
+
+    WiFi.begin(ssid, password);
+
+    Serial.print("Connecting to Wi-Fi");
+
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+
+    Serial.println("\nWi-Fi connected!");
+
+    Serial.print("Open snapshot: http://");
+    Serial.print(WiFi.localIP());
+    Serial.println("/jpg");
+
+    Serial.print("Open stream : http://");
+    Serial.print(WiFi.localIP());
+    Serial.println("/stream");
+
+    server.begin();
+}
+
+void loop() {
+
+    WiFiClient client = server.available();
+
+    if (!client) {
+        delay(10);
+        return;
+    }
+
+    String req = client.readStringUntil('\n');
+
+    if (req.startsWith("GET /jpg")) {
+
+        while (client.available()) {
+            client.read();
+        }
+
+        send_snapshot(client);
+
+    } else if (req.startsWith("GET /stream")) {
+
+        while (client.available()) {
+            client.read();
+        }
+
+        send_stream(client);
+
+    } else {
+
+        client.print(
+            F("HTTP/1.1 200 OK\r\n"
+              "Content-Type: text/html\r\n\r\n"
+              "<h2>ESP32-CAM (RGB565->JPEG)</h2>"
+              "<p><a href='/jpg'>Snapshot</a></p>"
+              "<p><a href='/stream'>Stream</a></p>")
+        );
+    }
+
+    client.stop();
+}
